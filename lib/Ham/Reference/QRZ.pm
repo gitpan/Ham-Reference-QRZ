@@ -3,7 +3,7 @@ package Ham::Reference::QRZ;
 # --------------------------------------------------------------------------
 # Ham::Reference::QRZ - An interface to the QRZ XML Database Service
 #
-# Copyright (c) 2008 Brad McConahay N8QQ.  All rights reserved.
+# Copyright (c) 2008-2009 Brad McConahay N8QQ.  All rights reserved.
 # Cincinnati, Ohio USA
 # --------------------------------------------------------------------------
 
@@ -13,7 +13,7 @@ use XML::Simple;
 use LWP::UserAgent;
 use vars qw($VERSION);
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 my $qrz_url = "http://online.qrz.com";
 my $site_name = 'QRZ XML Database Service';
@@ -174,6 +174,10 @@ sub _get_xml
 	my $content = $response->content;
 	chomp $content;
 	$content =~ s/(\r|\n)//g;
+
+	$content =~ s/iso8859-1/iso-8859-1/; # added to account for what appears to be an
+                                         # incorrect encoding declearation string, 2009-10-31 bam
+
 	my $xs = XML::Simple->new( SuppressEmpty => 0 );
 	my $data = $xs->XMLin($content);
 	return $data;
@@ -188,7 +192,7 @@ Ham::Reference::QRZ - An object oriented front end for the QRZ.COM Amateur Radio
 
 =head1 VERSION
 
-Version 0.01
+Version 0.02
 
 =head1 SYNOPSIS
 
@@ -407,7 +411,7 @@ Brad McConahay N8QQ, C<< <brad at n8qq.com> >>
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright 2008 Brad McConahay N8QQ, all rights reserved.
+Copyright 2008-2009 Brad McConahay N8QQ, all rights reserved.
 
 This program is free software; you can redistribute it and/or modify it
 under the same terms as Perl itself.
