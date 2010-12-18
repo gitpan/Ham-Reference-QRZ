@@ -3,7 +3,7 @@ package Ham::Reference::QRZ;
 # --------------------------------------------------------------------------
 # Ham::Reference::QRZ - An interface to the QRZ XML Database Service
 #
-# Copyright (c) 2008-2009 Brad McConahay N8QQ.  All rights reserved.
+# Copyright (c) 2008-2010 Brad McConahay N8QQ.
 # Cincinnati, Ohio USA
 # --------------------------------------------------------------------------
 
@@ -11,11 +11,12 @@ use strict;
 use warnings;
 use XML::Simple;
 use LWP::UserAgent;
+use HTML::Entities;
 use vars qw($VERSION);
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
-my $qrz_url = "http://online.qrz.com";
+my $qrz_url = "http://www.qrz.com/xml";
 my $site_name = 'QRZ XML Database Service';
 my $default_timeout = 10;
 
@@ -31,22 +32,22 @@ sub new
 	$self->set_username($args{username}) if $args{username};
 	$self->set_password($args{password}) if $args{password};
 	$self->set_key($args{key}) if $args{key};
+	$self->_clear_errors;
 	return $self;
 }
 
 sub login
 {
 	my $self = shift;
+	$self->_clear_errors;
+	if (!$self->{_username}) { die "No QRZ subscription username given" }
+	if (!$self->{_password}) { die "No QRZ subscription password given" }
 	my $url = "$qrz_url/bin/xml?username=$self->{_username};password=$self->{_password};agent=$self->{_agent}";
 	my $login = $self->_get_xml($url);
 	if ($login->{Session}->{Error}) {
-		$self->{is_error} = 1;
-		$self->{error_message} = $login->{Session}->{Error};
-		return undef;
+		die $login->{Session}->{Error};
 	} elsif (!$login->{Session}->{Key}) {
-		$self->{is_error} = 1;
-		$self->{error_message} = "Unknown Error - Could not retrieve session key";
-		return undef;
+		die "Unknown Error - Could not retrieve session key";
 	} else {
 		$self->set_key($login->{Session}->{Key});
 		$self->{_session} = $login->{Session};
@@ -94,6 +95,7 @@ sub set_timeout
 sub get_listing
 {
 	my $self = shift;
+	$self->_clear_errors;
 	return $self->{_listing} if $self->{_listing}->{call};
 	if (!$self->{_callsign}) {
 		$self->{is_error} = 1;
@@ -117,6 +119,7 @@ sub get_listing
 sub get_bio
 {
 	my $self = shift;
+	$self->_clear_errors;
 	return $self->{_bio} if $self->{_bio}->{call};
 	if (!$self->{_callsign}) {
 		$self->{is_error} = 1;
@@ -135,6 +138,64 @@ sub get_bio
 	}
 	$self->{_session} = $bio->{Session};
 	$self->{_bio} = $bio->{Bio};
+}
+
+sub get_bio_file
+{
+	my $self = shift;
+	$self->_clear_errors;
+	$self->get_bio if !$self->{_bio}->{call};
+	if (!$self->{_bio}->{bio}) {
+		$self->{is_error} = 1;
+		$self->{error_message} = 'No URL for bio file is available for this callsign';
+		return undef;		
+	}
+	my $url = "$self->{_bio}->{bio}";
+	my $content = $self->_get_http($url);
+	return undef if $self->{is_error};
+	$content =~ s/&nbsp;/ /g; # convert nbsp entity to regular printable spaces
+	$content = decode_entities($content);
+	$content =~ s/<.*?>//g; # strip html
+	return $content;
+}
+
+sub get_dxcc
+{
+	my $self = shift;
+	$self->_clear_errors;
+	return $self->{_dxcc} if $self->{_dxcc}->{call};
+	if (!$self->{_callsign}) {
+		$self->{is_error} = 1;
+		$self->{error_message} = "Can not get data without a callsign";
+		return undef;
+	}	
+	if (!$self->{_key}) {
+		$self->login;
+	}
+	my $url = "$qrz_url/bin/xml?s=$self->{_key};dxcc=$self->{_callsign}";
+	my $bio = $self->_get_xml($url);
+	if ($bio->{Session}->{Error}) {
+		$self->{is_error} = 1;
+		$self->{error_message} = $bio->{Session}->{Error};
+		return undef;
+	}
+	$self->{_session} = $bio->{Session};
+	$self->{_dxcc} = $bio->{DXCC};
+}
+
+sub get_arrl_section
+{
+	my $self = shift;
+	$self->_clear_errors;
+	$self->get_listing if !$self->{_listing}->{callsign};
+	if (!$self->{_listing}->{state} or (!$self->{_listing}->{county} and $self->{_listing}->{country} ne 'Canada')) {
+		$self->{is_error} = 1;
+		$self->{error_message} = "Unable to look up ARRL Section without state or county";
+		return undef;
+	}
+	my $sections = $self->_get_arrl_sections;
+	my $section = (ref($sections->{$self->{_listing}->{state}}) eq 'HASH') ? $sections->{$self->{_listing}->{state}}->{$self->{_listing}->{county}} : $sections->{$self->{_listing}->{state}};
+	return $section;
 }
 
 sub get_session
@@ -162,6 +223,23 @@ sub _get_xml
 {
 	my $self = shift;
 	my $url = shift;
+	my $content = $self->_get_http($url);
+	return undef if $self->{is_error};
+	chomp $content;
+	$content =~ s/(\r|\n)//g;
+
+	$content =~ s/iso8859-1/iso-8859-1/; # added to account for what appears to be an
+                                         # incorrect encoding declearation string, 2009-10-31 bam
+	my $xs = XML::Simple->new( SuppressEmpty => 0 );
+	my $data = $xs->XMLin($content);
+	return $data;
+}
+
+sub _get_http
+{
+	my $self = shift;
+	my $url = shift;
+	$self->_clear_errors;
 	my $ua = LWP::UserAgent->new( timeout=>$self->{_timeout} );
 	$ua->agent( $self->{_agent} );
 	my $request = HTTP::Request->new('GET', $url);
@@ -171,16 +249,674 @@ sub _get_xml
 		$self->{error_message} = "Could not contact $site_name - ".HTTP::Status::status_message($response->code);
 		return undef;
 	}
-	my $content = $response->content;
-	chomp $content;
-	$content =~ s/(\r|\n)//g;
+	return $response->content;
+}
 
-	$content =~ s/iso8859-1/iso-8859-1/; # added to account for what appears to be an
-                                         # incorrect encoding declearation string, 2009-10-31 bam
+sub _clear_errors
+{
+	my $self = shift;
+	$self->{is_error} = 0;
+	$self->{error_message} = '';
+}
 
-	my $xs = XML::Simple->new( SuppressEmpty => 0 );
-	my $data = $xs->XMLin($content);
-	return $data;
+sub _get_arrl_sections {
+	return {
+		'AL' => 'AL',
+		'AK' => 'AK',
+		'AB' => 'AB',
+		'AZ' => 'AZ',
+		'AR' => 'AR',
+		'BC' => 'BC',
+		'CA' => {
+			'Alameda' => 'EB',
+			'Contra Costa' => 'EB',
+			'Napa' => 'EB',
+			'Solano' => 'EB',
+			'Los Angeles' => 'LAX',
+			'Inyo' => 'ORG',
+			'Orange' => 'ORG',
+			'Riverside' => 'ORG',
+			'San Bernardino' => 'ORG',
+			'San Luis Obispo' => 'SB',
+			'Santa Barbara' => 'SB',
+			'Ventura' => 'SB',
+			'Monterey' => 'SCV',
+			'San Benito' => 'SCV',
+			'San Mateo' => 'SCV',
+			'Santa Clara' => 'SCV',
+			'Santa Cruz' => 'SCV',
+			'Imperial' => 'SDG',
+			'San Diego' => 'SDG',
+			'Del Norte' => 'SF',
+			'Humboldt' => 'SF',
+			'Lake' => 'SF',
+			'Marin' => 'SF',
+			'Mendocino' => 'SF',
+			'San Francisco' => 'SF',
+			'Sonoma' => 'SF',
+			'Calaveras' => 'SJV',
+			'Fresno' => 'SJV',
+			'Kern' => 'SJV',
+			'Kings' => 'SJV',
+			'Madera' => 'SJV',
+			'Mariposa' => 'SJV',
+			'Merced' => 'SJV',
+			'Mono' => 'SJV',
+			'San Joaquin' => 'SJV',
+			'Stanislaus' => 'SJV',
+			'Tulare' => 'SJV',
+			'Tuolumne' => 'SJV',
+			'Alpine' => 'SV',
+			'Amador' => 'SV',
+			'Butte' => 'SV',
+			'Colusa' => 'SV',
+			'El Dorado' => 'SV',
+			'Glenn' => 'SV',
+			'Lassen' => 'SV',
+			'Modoc' => 'SV',
+			'Nevada' => 'SV',
+			'Placer' => 'SV',
+			'Plumas' => 'SV',
+			'Sacramento' => 'SV',
+			'Shasta' => 'SV',
+			'Sierra' => 'SV',
+			'Siskiyou' => 'SV',
+			'Sutter' => 'SV',
+			'Tehama' => 'SV',
+			'Trinity' => 'SV',
+			'Yolo' => 'SV',
+			'Yuba' => 'SV'
+		},
+		'CO' => 'CO',
+		'CT' => 'CT',
+		'DE' => 'DE',
+		'DC' => 'MDC',
+		'FL' => {
+			'Alachua' => "NFL",
+			'Lee' => "SFL",
+			'Baker' => "NFL",
+			'Leon' => "NFL",
+			'Bay' => "NFL",
+			'Levy' => "NFL",
+			'Bradford' => "NFL",
+			'Liberty' => "NFL",
+			'Brevard' => "SFL",
+			'Madison' => "NFL",
+			'Broward' => "SFL",
+			'Manatee' => "WCF",
+			'Calhoun' => "NFL",
+			'Marion' => "NFL",
+			'Charlotte' => "WCF",
+			'Martin' => "SFL",
+			'Citrus' => "NFL",
+			'Miami-Dade' => "SFL",
+			'Clay' => "NFL",
+			'Monroe' => "SFL",
+			'Collier' => "SFL",
+			'Nassau' => "NFL",
+			'Columbia' => "NFL",
+			'Okaloosa' => "NFL",
+			'Desoto' => "WCF",
+			'Okeechobee' => "SFL",
+			'Dixie' => "NFL",
+			'Orange' => "NFL",
+			'Duval' => "NFL",
+			'Osceola' => "SFL",
+			'Escambia' => "NFL",
+			'Palm Beach' => "SFL",
+			'Flagler' => "NFL",
+			'Pasco' => "WCF",
+			'Franklin' => "NFL",
+			'Pinellas' => "WCF",
+			'Gadsden' => "NFL",
+			'Polk' => "WCF",
+			'Gilchrist' => "NFL",
+			'Putnam' => "NFL",
+			'Glades' => "SFL",
+			'Santa Rosa' => "NFL",
+			'Gulf' => "NFL",
+			'Sarasota' => "WCF",
+			'Hamilton' => "NFL",
+			'Seminole' => "NFL",
+			'Hardee' => "WCF",
+			'St. Johns' => "NFL",
+			'Hendry' => "SFL",
+			'St. Lucie' => "SFL",
+			'Hernando' => "NFL",
+			'Sumter' => "NFL",
+			'Highlands' => "WCF",
+			'Suwannee' => "NFL",
+			'Hillsborough' => "WCF",
+			'Taylor' => "NFL",
+			'Holmes' => "NFL",
+			'Union' => "NFL",
+			'Indian River' => "SFL",
+			'Volusia' => "NFL",
+			'Jackson' => "NFL",
+			'Wakulla' => "NFL",
+			'Jefferson' => "NFL",
+			'Walton' => "NFL",
+			'Lafayette' => "NFL",
+			'Washington' => "NFL",
+			'Lake' => "NFL"
+		},
+		'GA' => 'GA',
+		'GU' => 'GU',
+		'HI' => 'PAC',
+		'ID' => 'ID',
+		'IL' => 'IL',
+		'IN' => 'IN',
+		'IA' => 'IA',
+		'KS' => 'KS',
+		'KY' => 'KY',
+		'LA' => 'LA',
+		'MA' => {
+			'Barnstable' => 'EMA',
+			'Bristol' => 'EMA',
+			'Dukes' => 'EMA',
+			'Essex' => 'EMA',
+			'Middlesex' => 'EMA',
+			'Nantucket' => 'EMA',
+			'Norfolk' => 'EMA',
+			'Plymouth' => 'EMA',
+			'Berkshire' => 'WMA',
+			'Franklin' => 'WMA',
+			'Hampden' => 'WMA',
+			'Hampshire' => 'WMA',
+			'Worcester' => 'WMA'
+		},
+		'ME' => 'ME',
+		'MB' => 'MB',
+		'MD' => 'MDC',
+		'MI' => 'MI',
+		'MN' => 'MN',
+		'MS' => 'MS',
+		'MO' => 'MO',
+		'MT' => 'MT',
+		'NB' => 'NB',
+		'NC' => 'NC',
+		'ND' => 'ND',
+		'NE' => 'NE',
+		'NH' => 'NH',
+		'NJ' => {
+			'Bergen' => 'NNJ',
+			'Essex' => 'NNJ',
+			'Hudson' => 'NNJ',
+			'Hunterdon' => 'NNJ',
+			'Middlesex' => 'NNJ',
+			'Monmouth' => 'NNJ',
+			'Morris' => 'NNJ',
+			'Passaic' => 'NNJ',
+			'Somerset' => 'NNJ',
+			'Sussex' => 'NNJ',
+			'Union' => 'NNJ',
+			'Warren' => 'NNJ',
+			'Atlantic' => 'SNJ',
+			'Burlington' => 'SNJ',
+			'Camden' => 'SNJ',
+			'Cape May' => 'SNJ',
+			'Cumberland' => 'SNJ',
+			'Gloucester' => 'SNJ',
+			'Mercer' => 'SNJ',
+			'Ocean' => 'SNJ',
+			'Salem' => 'SNJ'
+		},
+		'NL' => 'NL',
+		'NM' => 'NM',
+		'NS' => 'NS',
+		'NT' => 'NT',
+		'NU' => 'NU',
+		'NV' => 'NV',
+		'NY' => {
+			'Bronx' => 'NLI',
+			'New York' => 'NLI',
+			'Kings' => 'NLI',
+			'Queens' => 'NLI',
+			'Richmond' => 'NLI',
+			'Nassau' => 'NLI',
+			'Suffolk' => 'NLI',
+			'Albany' => 'ENY', 
+			'Columbia' => 'ENY', 
+			'Dutchess' => 'ENY', 
+			'Greene' => 'ENY', 
+			'Orange' => 'ENY', 
+			'Putnam' => 'ENY', 
+			'Rensselaer' => 'ENY', 
+			'Rockland' => 'ENY', 
+			'Saratoga' => 'ENY', 
+			'Schenectady' => 'ENY', 
+			'Sullivan' => 'ENY', 
+			'Ulster' => 'ENY', 
+			'Warren' => 'ENY', 
+			'Washington' => 'ENY', 
+			'Westchester' => 'ENY',
+			'Clinton' => 'NNY', 
+			'Essex' => 'NNY', 
+			'Franklin' => 'NNY', 
+			'Fulton' => 'NNY', 
+			'Hamilton' => 'NNY', 
+			'Jefferson' => 'NNY', 
+			'Lewis' => 'NNY', 
+			'Montgomery' => 'NNY', 
+			'St. Lawrence' => 'NNY', 
+			'Schoharie' => 'NNY',
+			'Allegany' => 'WNY', 
+			'Broome' => 'WNY', 
+			'Cattaraugus' => 'WNY', 
+			'Cayuga' => 'WNY', 
+			'Chautauqua' => 'WNY', 
+			'Chemung' => 'WNY', 
+			'Chenango' => 'WNY', 
+			'Cortland' => 'WNY', 
+			'Delaware' => 'WNY', 
+			'Erie' => 'WNY', 
+			'Genesee' => 'WNY', 
+			'Herkimer' => 'WNY', 
+			'Livingston' => 'WNY', 
+			'Madison' => 'WNY', 
+			'Monroe' => 'WNY', 
+			'Niagara' => 'WNY', 
+			'Oneida' => 'WNY', 
+			'Onondaga' => 'WNY', 
+			'Ontario' => 'WNY', 
+			'Orleans' => 'WNY', 
+			'Oswego' => 'WNY', 
+			'Otsego' => 'WNY', 
+			'Schuyler' => 'WNY', 
+			'Seneca' => 'WNY', 
+			'Steuben' => 'WNY', 
+			'Tioga' => 'WNY', 
+			'Tompkins' => 'WNY',
+			'Wayne' => 'WNY', 
+			'Wyoming' => 'WNY', 
+			'Yates' => 'WNY'
+		},
+		'OH' => 'OH',
+		'OK' => 'OK',
+		'ON' => 'ON',
+		'OR' => 'OR',
+		'PA' => { 
+			'Adams' => 'EPA',
+			'Berks' => 'EPA',
+			'Bradford' => 'EPA',
+			'Bucks' => 'EPA',
+			'Carbon' => 'EPA',
+			'Chester' => 'EPA',
+			'Columbia' => 'EPA',
+			'Cumberland' => 'EPA',
+			'Dauphin' => 'EPA',
+			'Delaware' => 'EPA',
+			'Juniata' => 'EPA',
+			'Lackawanna' => 'EPA',
+			'Lancaster' => 'EPA',
+			'Lebanon' => 'EPA',
+			'Lehigh' => 'EPA',
+			'Luzerne' => 'EPA',
+			'Lycoming' => 'EPA',
+			'Monroe' => 'EPA',
+			'Montgomery' => 'EPA',
+			'Montour' => 'EPA',
+			'Northhampton' => 'EPA',
+			'Northumberland' => 'EPA',
+			'Perry' => 'EPA',
+			'Philadelphia' => 'EPA',
+			'Pike' => 'EPA',
+			'Schuylkill' => 'EPA',
+			'Snyder' => 'EPA',
+			'Sullivan' => 'EPA',
+			'Susquehanna' => 'EPA',
+			'Tioga' => 'EPA',
+			'Union' => 'EPA',
+			'Wayne' => 'EPA',
+			'Wyoming' => 'EPA',
+			'York' => 'EPA',
+			'Allegheny' => 'WPA',
+			'Armstrong' => 'WPA',
+			'Beaver' => 'WPA',
+			'Bedford' => 'WPA',
+			'Blair' => 'WPA',
+			'Butler' => 'WPA',
+			'Cambria' => 'WPA',
+			'Cameron' => 'WPA',
+			'Centre' => 'WPA',
+			'Clarion' => 'WPA',
+			'Clearfield' => 'WPA',
+			'Clinton' => 'WPA',
+			'Crawford' => 'WPA',
+			'Elk' => 'WPA',
+			'Erie' => 'WPA',
+			'Fayette' => 'WPA',
+			'Franklin' => 'WPA',
+			'Fulton' => 'WPA',                  
+			'Greene' => 'WPA',
+			'Huntingdon' => 'WPA',
+			'Indiana' => 'WPA',                      
+			'Jefferson' => 'WPA',                       
+			'Lawrence' => 'WPA',
+			'McKean' => 'WPA',
+			'Mercer' => 'WPA',
+			'Mifflin' => 'WPA',                                   
+			'Potter' => 'WPA', 
+			'Somerset' => 'WPA',                 
+			'Venango' => 'WPA',
+			'Warren' => 'WPA',
+			'Washington' => 'WPA',
+			'Westmoreland' => 'WPA'
+		},
+		'PE' => 'MAR',
+		'PR' => 'PR',
+		'QC' => 'QC',
+		'RI' => 'RI',
+		'SK' => 'SK',
+		'SC' => 'SC',
+		'SD' => 'SD',
+		'TN' => 'TN',
+		'TX' => {
+			'Anderson' => 'WTX',
+			'Andrews' => 'WTX',
+			'Angelina' => 'STX',
+			'Aransas' => 'STX',
+			'Archer' => 'NTX',
+			'Armstrong' => 'WTX',
+			'Atascosa' => 'STX',
+			'Austin' => 'STX',
+			'Bailey' => 'WTX',
+			'Bandera' => 'STX',
+			'Bastrop' => 'WTX',
+			'Baylor' => 'NTX',
+			'Bee' => 'STX',
+			'Bell' => 'NTX',
+			'Bexar' => 'STX',
+			'Blanco' => 'STX',
+			'Borden' => 'WTX',
+			'Bosque' => 'NTX',
+			'Bowie' => 'NTX',
+			'Brazoria' => 'STX',
+			'Brazos' => 'STX',
+			'Brewster' => 'WTX',
+			'Briscoe' => 'WTX',
+			'Brooks' => 'STX',
+			'Brown' => 'NTX',
+			'Burleson' => 'STX',
+			'Burnet' => 'STX',
+			'Caldwell' => 'STX',
+			'Calhoun' => 'STX',
+			'Callahan' => 'WTX',
+			'Cameron' => 'STX',
+			'Camp' => 'NTX',
+			'Carson' => 'WTX',
+			'Cass' => 'NTX',
+			'Castro' => 'WTX',
+			'Chambers' => 'STX',
+			'Cherokee' => 'NTX',
+			'Childress' => 'WTX',
+			'Clay' => 'NTX',
+			'Cochran' => 'WTX',
+			'Coke' => 'WTX',
+			'Coleman' => 'WTX',
+			'Collin' => 'NTX',
+			'Collingsworth' => 'WTX',
+			'Colorado' => 'STX',
+			'Comal' => 'STX',
+			'Comanche' => 'NTX',
+			'Concho' => 'WTX',
+			'Cooke' => 'NTX',
+			'Coryell' => 'NTX',
+			'Cottle' => 'WTX',
+			'Crane' => 'WTX',
+			'Crockett' => 'WTX',
+			'Crosby' => 'WTX',
+			'Culberson' => 'WTX',
+			'Dallam' => 'WTX',
+			'Dallas' => 'NTX',
+			'Dawson' => 'WTX',
+			'Deaf Smith' => 'WTX',
+			'Delta' => 'NTX',
+			'Denton' => 'NTX',
+			'DeWitt' => 'STX',
+			'Dickens' => 'WTX',
+			'Dimmit' => 'STX',
+			'Donley' => 'WTX',
+			'Duval' => 'STX',
+			'Eastland' => 'NTX',
+			'Ector' => 'WTX',
+			'Edwards' => 'STX',
+			'El Paso' => 'WTX',
+			'Ellis' => 'NTX',
+			'Erath' => 'NTX',
+			'Falls' => 'NTX',
+			'Fannin' => 'NTX',
+			'Fayette' => 'STX',
+			'Fisher' => 'WTX',
+			'Floyd' => 'WTX',
+			'Foard' => 'WTX',
+			'Fort Bend' => 'STX',
+			'Franklin' => 'NTX',
+			'Freestone' => 'NTX',
+			'Frio' => 'STX',
+			'Gaines' => 'WTX',
+			'Galveston' => 'STX',
+			'Garza' => 'WTX',
+			'Gillespie' => 'STX',
+			'Glasscock' => 'WTX',
+			'Goliad' => 'STX',
+			'Gonzales' => 'STX',
+			'Gray' => 'WTX',
+			'Grayson' => 'NTX',
+			'Gregg' => 'NTX',
+			'Grimes' => 'STX',
+			'Guadalupe' => 'STX',
+			'Hale' => 'WTX',
+			'Hall' => 'WTX',
+			'Hamilton' => 'NTX',
+			'Hansford' => 'WTX',
+			'Hardeman' => 'WTX',
+			'Hardin' => 'STX',
+			'Harris' => 'STX',
+			'Harrison' => 'NTX',
+			'Hartley' => 'WTX',
+			'Haskell' => 'WTX',
+			'Hays' => 'STX',
+			'Hemphill' => 'WTX',
+			'Henderson' => 'NTX',
+			'Hidalgo' => 'STX',
+			'Hill' => 'NTX',
+			'Hockley' => 'WTX',
+			'Hood' => 'NTX',
+			'Hopkins' => 'NTX',
+			'Houston' => 'STX',
+			'Howard' => 'WTX',
+			'Hudspeth' => 'WTX',
+			'Hunt' => 'NTX',
+			'Hutchinson' => 'WTX',
+			'Irion' => 'WTX',
+			'Jack' => 'NTX',
+			'Jackson' => 'STX',
+			'Jasper' => 'STX',
+			'Jeff Davis' => 'WTX',
+			'Jefferson' => 'STX',
+			'Jim Hogg' => 'STX',
+			'Jim Wells' => 'STX',
+			'Johnson' => 'NTX',
+			'Jones' => 'WTX',
+			'Karnes' => 'STX',
+			'Kaufman' => 'NTX',
+			'Kendall' => 'STX',
+			'Kenedy' => 'STX',
+			'Kent' => 'WTX',
+			'Kerr' => 'STX',
+			'Kimble' => 'STX',
+			'King' => 'WTX',
+			'Kinney' => 'STX',
+			'Kleberg' => 'STX',
+			'Knox' => 'WTX',
+			'La Salle' => 'STX',
+			'Lamar' => 'NTX',
+			'Lamb' => 'WTX',
+			'Lampasas' => 'NTX',
+			'Lavaca' => 'STX',
+			'Lee' => 'STX',
+			'Leon' => 'STX',
+			'Liberty' => 'STX',
+			'Limestone' => 'NTX',
+			'Lipscomb' => 'WTX',
+			'Live Oak' => 'STX',
+			'Llano' => 'STX',
+			'Loving' => 'WTX',
+			'Lubbock' => 'WTX',
+			'Lynn' => 'WTX',
+			'Madison' => 'STX',
+			'Marion' => 'NTX',
+			'Martin' => 'WTX',
+			'Mason' => 'STX',
+			'Matagorda' => 'STX',
+			'Maverick' => 'STX',
+			'McCulloch' => 'STX',
+			'McLennan' => 'NTX',
+			'McMullen' => 'STX',
+			'Medina' => 'STX',
+			'Menard' => 'STX',
+			'Midland' => 'WTX',
+			'Milam' => 'STX',
+			'Mills' => 'NTX',
+			'Mitchell' => 'WTX',
+			'Montague' => 'NTX',
+			'Montgomery' => 'STX',
+			'Moore' => 'WTX',
+			'Morris' => 'NTX',
+			'Motley' => 'WTX',
+			'Nacogdoches' => 'NTX',
+			'Navarro' => 'NTX',
+			'Newton' => 'STX',
+			'Nolan' => 'WTX',
+			'Nueces' => 'STX',
+			'Ochiltree' => 'WTX',
+			'Oldham' => 'WTX',
+			'Orange' => 'STX',
+			'Palo Pinto' => 'NTX',
+			'Panola' => 'NTX',
+			'Parker' => 'NTX',
+			'Parmer' => 'WTX',
+			'Pecos' => 'WTX',
+			'Polk' => 'STX',
+			'Potter' => 'WTX',
+			'Presidio' => 'WTX',
+			'Rains' => 'NTX',
+			'Randall' => 'WTX',
+			'Reagan' => 'WTX',
+			'Real' => 'STX',
+			'Red River' => 'NTX',
+			'Reeves' => 'WTX',
+			'Refugio' => 'STX',
+			'Roberts' => 'WTX',
+			'Robertson' => 'STX',
+			'Rockwall' => 'NTX',
+			'Runnels' => 'WTX',
+			'Rusk' => 'NTX',
+			'Sabine' => 'STX',
+			'San Augustine' => 'STX',
+			'San Jacinto' => 'STX',
+			'San Patricio' => 'STX',
+			'San Saba' => 'STX',
+			'Schleicher' => 'WTX',
+			'Scurry' => 'WTX',
+			'Shackelford' => 'WTX',
+			'Shelby' => 'NTX',
+			'Sherman' => 'WTX',
+			'Smith' => 'NTX',
+			'Somervell' => 'NTX',
+			'Starr' => 'STX',
+			'Stephens' => 'NTX',
+			'Sterling' => 'WTX',
+			'Stonewall' => 'WTX',
+			'Sutton' => 'WTX',
+			'Swisher' => 'WTX',
+			'Tarrant' => 'NTX',
+			'Taylor' => 'WTX',
+			'Terrell' => 'WTX',
+			'Terry' => 'WTX',
+			'Throckmorton' => 'NTX',
+			'Titus' => 'NTX',
+			'Tom Green' => 'WTX',
+			'Travis' => 'STX',
+			'Trinity' => 'STX',
+			'Tyler' => 'STX',
+			'Upshur' => 'NTX',
+			'Upton' => 'WTX',
+			'Uvalde' => 'STX',
+			'Val Verde' => 'STX',
+			'Van Zandt' => 'NTX',
+			'Victoria' => 'STX',
+			'Walker' => 'STX',
+			'Waller' => 'STX',
+			'Ward' => 'WTX',
+			'Washington' => 'STX',
+			'Webb' => 'STX',
+			'Wharton' => 'STX',
+			'Wheeler' => 'WTX',
+			'Wichita' => 'NTX',
+			'Wilbarger' => 'NTX',
+			'Willacy' => 'STX',
+			'Williamson' => 'STX',
+			'Wilson' => 'STX',
+			'Winkler' => 'WTX',
+			'Wise' => 'NTX',
+			'Wood' => 'NTX',
+			'Yoakum' => 'WTX',
+			'Young' => 'NTX',
+			'Zapata' => 'STX',
+			'Zavala' => 'STX'
+		},
+		'UT' => 'UT',
+		'VT' => 'VT',
+		'VA' => 'VA',
+		'VI' => 'VI',
+		'WA' => {
+			'Adams' => 'EWA',
+			'Asotin' => 'EWA',
+			'Benton' => 'EWA',
+			'Chelan' => 'EWA',
+			'Columbia' => 'EWA',
+			'Douglas' => 'EWA',
+			'Ferry' => 'EWA',
+			'Franklin' => 'EWA',
+			'Garfield' => 'EWA',
+			'Grant' => 'EWA',
+			'Kittitas' => 'EWA',
+			'Klickitat' => 'EWA',
+			'Lincoln' => 'EWA',
+			'Okanogan' => 'EWA',
+			'Pend Oreille' => 'EWA',
+			'Spokane' => 'EWA',
+			'Stevens' => 'EWA',
+			'Walla Walla' => 'EWA',
+			'Whitman' => 'EWA',
+			'Yakima' => 'EWA',
+			'Clallam' => 'WWA',
+			'Clark' => 'WWA',
+			'Cowlitz' => 'WWA',
+			'Grays Harbor' => 'WWA',
+			'Island' => 'WWA',
+			'Jefferson' => 'WWA',
+			'King' => 'WWA',
+			'Kitsap' => 'WWA',
+			'Lewis' => 'WWA',
+			'Mason' => 'WWA',
+			'Pacific' => 'WWA',
+			'Pierce' => 'WWA',
+			'San Juan' => 'WWA',
+			'Skagit' => 'WWA',
+			'Skamania' => 'WWA',
+			'Snohomish' => 'WWA',
+			'Thurston' => 'WWA',
+			'Wahkiakum' => 'WWA',
+			'Whatcom' => 'WWA'
+		},
+		'WI' => 'WI',
+		'WV' => 'WV',
+		'WY' => 'WY',
+		'YT' => 'YT'
+	};
 }
 
 1;
@@ -192,7 +928,7 @@ Ham::Reference::QRZ - An object oriented front end for the QRZ.COM Amateur Radio
 
 =head1 VERSION
 
-Version 0.02
+Version 0.03
 
 =head1 SYNOPSIS
 
@@ -205,13 +941,17 @@ Version 0.02
    password => 'your_password'
  );
 
- # get the listing and bio
+ # get the listing, bio and other information
  my $listing = $qrz->get_listing;
  my $bio = $qrz->get_bio;
+ my $dxcc = $qrz->get_dxcc;
+ my $session = $qrz->get_session;
 
  # dump the data to see how it's structured
  print Dumper($listing);
  print Dumper($bio);
+ print Dumper($dxcc);
+ print Dumper($session);
 
  # set a different callsign to look up
  $qrz->set_callsign('W8IRC');
@@ -219,6 +959,23 @@ Version 0.02
  # get the listing and print some specific info
  $listing = $qrz->get_listing;
  print "Name: $listing->{name}\n";
+
+ # show some dxcc info
+ print "DXCC Continent: $dxcc->{continent}\n";
+ print "DXCC Name: $dxcc->{name}\n";
+ print "CQ Zone: $dxcc->{cqzone}\n";
+
+ # show some session info
+ print "Lookups in current 24 hour period: $session->{Count}\n";
+ print "QRZ subscription expiration: $session->{SubExp}\n";
+
+ # show the ARRL section
+ my $arrl_section = $qrz->get_arrl_section;
+ print "ARRL Section: $arrl_section\n";
+
+ # show biography details, if any
+ my $bio = $qrz->get_bio_file;
+ print "Biography: $bio\n";
 
 =head1 DESCRIPTION
 
@@ -235,7 +992,7 @@ without raising an error, so long as the information received consists of proper
 
 Therefore, this module will not attempt to list or manage individual elements of a callsign.  You
 will need to inspect the hash reference keys to see which elements are available for any given
-callsign.
+callsign, as demonstrated in the synopsis.
 
 This module does not handle any management of reusing session keys at this time.
 
@@ -315,7 +1072,7 @@ This module does not handle any management of reusing session keys at this time.
  Args     : n/a
  Notes    : if a session key has not already been set, this method will automatically login.
             if a there is already listing information set from a previous lookup,
-            this will just return that data.  do a new set_callsign() if you need to refresh
+            this will just return that data.  call a new set_callsign() if you need to refresh
             the data with a new call to the qrz database.
 
 =head2 get_bio()
@@ -326,8 +1083,40 @@ This module does not handle any management of reusing session keys at this time.
  Args     : n/a
  Notes    : if a session key has not already been set, this method will automatically login.
             if a there is already biographical information set from a previous lookup,
-            this will just return that data.  do a new set_callsign() if you need to refresh
+            this will just return that data.  call a new set_callsign() if you need to refresh
+            the data with a new call to the qrz database.  this method only retrieves the meta
+            information about the bio.  call get_bio_file to get the actual contents of the bio.
+
+=head2 get_bio_file()
+
+ Usage    : $scalar = $qrz->get_bio_file;
+ Function : retrieves the full biography of a callsign from QRZ, if any is available
+ Returns  : a scalar
+ Args     : n/a
+ Notes    : if the get_bio method has not been called yet, it will be called first to get
+            the url for the bio file.  any html entities in the contents of the bio will be
+            converted to plain text, and all html will be stripped.  hard line breaks will be
+            left in place.  suggestions are welcome on how this data might better be filtered.
+
+=head2 get_dxcc()
+
+ Usage    : $hashref = $qrz->get_dxcc;
+ Function : retrieves DXCC information for a callsign from QRZ
+ Returns  : a hash reference
+ Args     : n/a
+ Notes    : if a session key has not already been set, this method will automatically login.
+            if a there is already dxcc information set from a previous lookup,
+            this will just return that data.  call a new set_callsign() if you need to refresh
             the data with a new call to the qrz database.
+
+=head2 get_arrl_section()
+
+ Usage    : $scalar = $qrz->get_arrl_section;
+ Function : returns ARRL Section information for a callsign
+ Returns  : a scalar
+ Args     : n/a
+ Notes    : if get listing has not yet been called, it will call get_listing to get state and county.
+            this method gets its data internally, and does not query the qrz xml server.
 
 =head2 login()
 
@@ -368,6 +1157,8 @@ This module does not handle any management of reusing session keys at this time.
 
 =item * L<LWP::UserAgent>
 
+=item * L<HTML::Entities>
+
 =item * An Internet connection
 
 =item * A QRZ.COM subscription that includes access to the QRZ XML Database Service
@@ -378,15 +1169,15 @@ This module does not handle any management of reusing session keys at this time.
 
 =over 4
 
-=item * Improve error checking and handling.
-
 =item * Session key reuse between instances (maybe).
 
-=item * Look into any possible needed escaping, filtering, etc.
+=item * Look into any escaping or filtering of data that would be helpful, particularly with regard to get_bio_file().
 
 =back
 
 =head1 ACKNOWLEDGEMENTS
+
+Thanks to Thomas Schaefer NY4I for the idea, original code, and data for the ARRL Section additions!
 
 This module accesses data from the widely popular QRZ.COM Database.  See http://www.qrz.com
 
@@ -397,11 +1188,11 @@ This module accesses data from the widely popular QRZ.COM Database.  See http://
 =item
 
 In order to use this module you need to have a subscription for the QRZ XML Database Service.
-See http://online.qrz.com
+See http://www.qrz.com/XML/index.html
 
 =item
 
-The technical reference for the QRZ XML Database Service is at http://online.qrz.com/specifications.html
+The technical reference for the QRZ XML Database Service is at http://www.qrz.com/XML/current_spec.html
 
 =back
 
@@ -411,8 +1202,14 @@ Brad McConahay N8QQ, C<< <brad at n8qq.com> >>
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright 2008-2009 Brad McConahay N8QQ, all rights reserved.
+C<Ham::Reference::QRZ> is Copyright (C) 2008-2010 Brad McConahay N8QQ.
 
-This program is free software; you can redistribute it and/or modify it
-under the same terms as Perl itself.
+This module is free software; you can redistribute it and/or
+modify it under the terms of the Artistic License 2.0. For
+details, see the full text of the license in the file LICENSE.
+
+This program is distributed in the hope that it will be
+useful, but it is provided "as is" and without any express
+or implied warranties. For details, see the full text of
+the license in the file LICENSE.
 
